@@ -1,0 +1,30 @@
+import sys
+sys.dont_write_bytecode = True
+import asyncio
+import asyncio_dgram
+
+from FortniteGameserver import UNetConnection
+
+class EasyFN():
+    def __init__(self, port: int, ip: str):
+        self.loop = asyncio.get_event_loop()
+        self.loop.create_task(self.start(port, ip))
+
+        self.UNetConnections = {}
+
+    async def start(self, port: int, ip: str):
+        socket = await asyncio_dgram.bind((ip, port))
+
+        print(f'Server started on {ip}:{port}')
+
+        while True:
+            data, remote_addr = await socket.recv()
+            if not f'{remote_addr[0]}:{remote_addr[1]}' in list(self.UNetConnections.keys()):
+                self.UNetConnections[f'{remote_addr[0]}:{remote_addr[1]}'] = UNetConnection(socket, remote_addr)
+            
+            await self.UNetConnections[f'{remote_addr[0]}:{remote_addr[1]}'].ReceivedRawPacket(data, len(data))
+
+EasyFN(
+    port = 7777,
+    ip = '127.0.0.1'
+).loop.run_forever()
