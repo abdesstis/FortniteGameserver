@@ -6,14 +6,11 @@ from .UObject import EChannelCloseReason
 from .Misc import EEngineNetworkVersionHistory
 from .Net import FInBunch
 
+from .World import UWorld
+from .Net import UChannel, UControlChannel
+from .PackageMapClient import UPackageMapClient
+
 StatelessConnectHandlerComponent = StatelessConnectHandlerComponent()
-
-# TODO: Create a new file
-class UChannel():
-    def ReceivedRawBunch(self, Bunch: FInBunch, bLocalSkipAck):
-        print(f'ReceivedRawBunch')
-
-
 
 # Types # https://github.com/EpicGames/UnrealEngine/blob/2bf1a5b83a7076a0fd275887b373f8ec9e99d431/Engine/Source/Runtime/Engine/Classes/Engine/NetConnection.h#L51
 MAX_CHSEQUENCE = 1024 # Power of 2 >RELIABLE_BUFFER, covering loss/misorder time.
@@ -50,7 +47,15 @@ class UNetConnection():
         self.InitHandler()
         self.InitTick()
         self.InitUnknown()
-    
+
+        # .-.
+        self.World = UWorld()
+
+    def InitBase(self):
+        # Create package map.
+        PackageMapClient = UPackageMapClient(self)
+        self.PackageMap = PackageMapClient
+
     def InitHandler(self):
         self.HandlerComponents = [StatelessConnectHandlerComponent] # TODO: AESGCMHandlerComponent, OodleHandlerComponent
 
@@ -66,18 +71,20 @@ class UNetConnection():
     def InitUnknown(self):
         # Not good yet :/
         self.InReliable = [0] * MAX_CHSEQUENCE # NOTE: This is wrong and makes no sense...
-        self.Channels = [0] * MAX_CHANNELS
-    def IsInternalAck(self):
+        self.Channels = [None] * MAX_CHANNELS
+        self.OpenChannels = []
+
+    def IsInternalAck(self) -> bool:
         return False
 
-    def EngineNetVer(self):
+    def EngineNetVer(self) -> int:
         # TODO: Parse almost all using https://github.com/EZFNDEV/FortLogReader
         return 2 # Season 1.8
         return 16 # Season 14.60
 
     # NOTE: We are in the wrong class, this function should be in UChannel
     # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L1068
-    def IsKnownChannelType(self, Type):
+    def IsKnownChannelType(self, Type) -> bool:
         if isinstance(Type, EChannelType):
             Type = Type.value
 
@@ -226,7 +233,7 @@ class UNetConnection():
             Bunch.bPartialFinal = Reader.ReadBit() if Bunch.bPartial else 0
 
             if (self.EngineNetVer() < EEngineNetworkVersionHistory.HISTORY_CHANNEL_NAMES.value):
-                Bunch.ChType =  Reader.ReadInt(EChannelType.CHTYPE_MAX.value) if (Bunch.bReliable or Bunch.bOpen) else EChannelType.CHTYPE_None
+                Bunch.ChType =  Reader.ReadInt(EChannelType.CHTYPE_MAX.value) if (Bunch.bReliable or Bunch.bOpen) else 0 # EChannelType.CHTYPE_None
                 if (Bunch.ChType == EChannelType.CHTYPE_Control.value):
                     Bunch.ChName = EChannelType.CHTYPE_Control
                 elif (Bunch.ChType == EChannelType.CHTYPE_Voice.value):
@@ -235,7 +242,7 @@ class UNetConnection():
                     Bunch.ChName = EChannelType.CHTYPE_Actor
             else:
                 if (Bunch.bReliable or Bunch.bOpen):
-                    Bunch.ChType =  Reader.ReadSerializedInt(EChannelType.CHTYPE_MAX.value) if (Bunch.bReliable or Bunch.bOpen) else EChannelType.CHTYPE_None
+                    Bunch.ChType =  Reader.ReadSerializedInt(EChannelType.CHTYPE_MAX.value) if (Bunch.bReliable or Bunch.bOpen) else 0 # EChannelType.CHTYPE_None
 
                     if (Bunch.ChType == EChannelType.CHTYPE_Control.value):
                         Bunch.ChName = EChannelType.CHTYPE_Control
@@ -334,14 +341,13 @@ class UNetConnection():
                 bSkipAck = True
     
     # UE 4.16
-    def CreateChannel(self, ChType: EChannelType, bOpenedLocally: bool, ChIndex: int):
+    def CreateChannel(self, ChType: EChannelType, bOpenedLocally: bool, ChIndex: int) -> UChannel:
         if not (self.IsKnownChannelType(ChType)):
             return
         
         # TODO: Make sure this connection is in a reasonable state.
 
         # If no channel index was specified, find the first available.
-        ChIndex = -1 # TODO: Fix
         if (ChIndex == -1): # INDEX_NONE	= -1
             FirstChannel = 1
             # Control channel is hardcoded to live at location 0
@@ -367,15 +373,17 @@ class UNetConnection():
         if not (ChIndex < 10240):
             return
         if not (self.Channels[ChIndex] == None):
-            return
+            pass
 
         # Create channel.
-        Channel = UChannel(self, ChIndex, bOpenedLocally, ChType)
+        # Only UControlChannel atm
+        Channel = UControlChannel(self, ChIndex, bOpenedLocally, ChType)
+
         self.Channels[ChIndex] = Channel
         self.OpenChannels.append(Channel)
         # Always tick the control & voice channels
         if (Channel.ChType == EChannelType.CHTYPE_Control or Channel.ChType == EChannelType.CHTYPE_Voice.value):
-            pass # self.StartTickingChannel(Channel)
+            self.StartTickingChannel(Channel)
 
         print(f'Created channel {ChIndex} of type {ChType}')
         return Channel
@@ -384,5 +392,5 @@ class UNetConnection():
         # Adds the channel to the ticking channels list. Used to selectively tick channels that have queued bunches or are pending dormancy.
         self.ChannelsToTick.append(Channel)
 
-    def CreateChannelByName(self, CreateFlags, ChIndex: int): # TODO: EChannelCreateFlags CreateFlags
+    def CreateChannelByName(self, CreateFlags, ChIndex: int) -> UChannel: # TODO: EChannelCreateFlags CreateFlags
         raise Exception('Not supported yet.')
