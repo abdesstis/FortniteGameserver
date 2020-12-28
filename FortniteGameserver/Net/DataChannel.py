@@ -1,9 +1,11 @@
 from enum import Enum
-from .DataBunch import FInBunch, FControlChannelOutBunch
+from .DataBunch import FInBunch, FOutBunch, FControlChannelOutBunch
 
 from ..Classes import EChannelType
 
 MAX_QUEUED_CONTROL_MESSAGES = 32768
+
+RELIABLE_BUFFER = 256 # Power of 2 >= 1.
 
 # https://github.com/EpicGames/UnrealEngine/blob/f8f4b403eb682ffc055613c7caf9d2ba5df7f319/Engine/Source/Runtime/Engine/Public/Net/DataChannel.h#L92
 class FNetControlMessage():
@@ -14,6 +16,15 @@ class FNetControlMessage():
         Bunch = FControlChannelOutBunch(Connection.Channels[0], False)
         MessageType = self.Index
         await Connection.Channels[0].SendBunch(Bunch, True)
+
+# Represents a range of PacketIDs, inclusive
+class FPacketIdRange:
+    def __init__(self, First: int = 0, Last: int = 0):
+        self.First = First
+        self.Last = Last
+
+    def InRange(self, PacketId: int):
+        return (self.First <= PacketId and PacketId <= self.Last)
 
 # https://github.com/EpicGames/UnrealEngine/blob/f8f4b403eb682ffc055613c7caf9d2ba5df7f319/Engine/Source/Runtime/Engine/Public/Net/DataChannel.h#L33
 # contains info about a message type retrievable without static binding (e.g. whether it's a valid type, friendly name string, etc)
@@ -58,15 +69,25 @@ class MessageTypes(Enum):
 class UChannel:
     def __init__(self, Connection, ChIndex: int, bOpenedLocally: bool, ChType: EChannelType):
         self.Connection = Connection
-        self.bOpenedLocally = bOpenedLocally
+        self.bOpenedLocally = False # bOpenedLocally
         self.ChIndex = ChIndex
         self.ChType = ChType
 
         # I guess this is wrong...
         self.InPartialBunch = FInBunch()
+        self.OpenPacketId = FPacketIdRange()
+        self.OutgoingBunches = []
+
+        self.Closing = False
+
+    # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L90
+    def SetClosingFlag(self):
+        self.Closing = True
     
     # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L313
     async def ReceivedRawBunch(self, Bunch: FInBunch, bOutSkipAck: bool):
+        print(f'ReceivedRawBunch')
+
         # Immediately consume the NetGUID portion of this bunch, regardless if it is partial or reliable.
         # NOTE - For replays, we do this even earlier, to try and load this as soon as possible, in case there is an issue creating the channel
         # If a replay fails to create a channel, we want to salvage as much as possible
@@ -249,8 +270,8 @@ class UChannel:
                 # Remember the range.
                 # In the case of a non partial, HandleBunch == Bunch
                 # In the case of a partial, HandleBunch should == InPartialBunch, and Bunch should be the last bunch.
-                # OpenPacketId.First = HandleBunch.PacketId
-                # OpenPacketId.Last = Bunch.PacketId
+                OpenPacketId.First = HandleBunch.PacketId
+                OpenPacketId.Last = Bunch.PacketId
                 OpenAcked = True
 
                 # UE_LOG( LogNetTraffic, Verbose, TEXT( "ReceivedNextBunch: Channel now fully open. ChIndex: %i, OpenPacketId.First: %i, OpenPacketId.Last: %i" ), ChIndex, OpenPacketId.First, OpenPacketId.Last );
@@ -269,9 +290,201 @@ class UChannel:
         if True: # (!Closing)
             await self.ReceivedBunch(Bunch)
 
-    async def SendBunch(self, *args, **kwargs): # TODO:
+    # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L747
+    async def SendBunch(self, Bunch: FOutBunch, Merge: bool):
         # Set bunch flags.
-        pass
+        if ((self.OpenPacketId.First == -1) and self.bOpenedLocally): # INDEX_NONE = -1
+            Bunch.bOpen = 1
+            OpenTemporary = not(Bunch.bReliable)
+        else:
+            OpenTemporary = self.bOpenedLocally
+        
+        # If channel was opened temporarily, we are never allowed to send reliable packets on it.
+        if (OpenTemporary or Bunch.bReliable):
+            return
+
+        # This is the max number of bits we can have in a single bunch
+        MAX_SINGLE_BUNCH_SIZE_BITS = self.Connection.GetMaxSingleBunchSizeBits() # TODO: Fix
+        # Max bytes we'll put in a partial bunch
+        MAX_SINGLE_BUNCH_SIZE_BYTES = MAX_SINGLE_BUNCH_SIZE_BITS / 8
+        # Max bits will put in a partial bunch (byte aligned, we dont want to deal with partial bytes in the partial bunches)
+        MAX_PARTIAL_BUNCH_SIZE_BITS = MAX_SINGLE_BUNCH_SIZE_BYTES * 8
+
+        # Add any export bunches
+        OutgoingBunches = self.AppendExportBunches()
+
+        if (len(OutgoingBunches) <= 0):
+            # Don't merge if we are exporting guid's
+            # We can't be for sure if the last bunch has exported guids as well, so this just simplifies things
+            Merge = False
+
+        # Append any "must be mapped" guids to front of bunch from the packagemap
+        self.AppendMustBeMappedGuids(Bunch)
+
+        if (Bunch.bHasMustBeMappedGUIDs):
+            # We can't merge with this, since we need all the unique static guids in the front
+            Merge = False
+        
+        # Contemplate merging.
+        PreExistingBits = 0
+
+        OutBunch = FOutBunch()
+
+        if (Merge): # TODO:  (	Merge&&	Connection->LastOut.ChIndex == Bunch->ChIndex&&	Connection->AllowMerge&&	Connection->LastEnd.GetNumBits()&&	Connection->LastEnd.GetNumBits()==Connection->SendBuffer.GetNumBits()&&	Connection->LastOut.GetNumBits() + Bunch->GetNumBits() <= MAX_SINGLE_BUNCH_SIZE_BITS )
+            # Merge.
+		    # check(!Connection->LastOut.IsError());
+            # PreExistingBits = Connection->LastOut.GetNumBits();
+            # Connection->LastOut.SerializeBits( Bunch->GetData(), Bunch->GetNumBits() );
+            # Connection->LastOut.bReliable |= Bunch->bReliable;
+            # Connection->LastOut.bOpen     |= Bunch->bOpen;
+            # Connection->LastOut.bClose    |= Bunch->bClose;
+            # OutBunch                       = Connection->LastOutBunch;
+            # Bunch                          = &Connection->LastOut;
+            # check(!Bunch->IsError());
+            # Connection->PopLastStart();
+            self.Connection.OutBunches -= 1
+
+        # Possibly split large bunch into list of smaller partial bunches
+        if(Bunch.GetNumBits() > MAX_SINGLE_BUNCH_SIZE_BITS):
+            # NOTE: We will not hit this since its set to 8000000
+            data = Bunch.GetData()
+            bitsLeft = Bunch.GetNumBits()
+            Merge = False
+
+            while (bitsLeft > 0):
+                pass
+        else:
+            self.OutgoingBunches.append(Bunch)
+
+        # Send all the bunches we need to
+        #    Note: this is done all at once. We could queue this up somewhere else before sending to Out.
+        PacketIdRange = FPacketIdRange()
+        # TODO: This... (Too lazy to do it rn...)
+        # bOverflowsReliable = (NumOutRec + OutgoingBunches.Num() >= RELIABLE_BUFFER + Bunch.bClose)
+        # bool bOverflowsReliable = (NumOutRec + OutgoingBunches.Num() >= RELIABLE_BUFFER + Bunch->bClose);
+
+        # if (OutgoingBunches.Num() >= CVarNetPartialBunchReliableThreshold->GetInt() && CVarNetPartialBunchReliableThreshold->GetInt() > 0)
+        # {
+        #     if (!bOverflowsReliable)
+        #     {
+        #         UE_LOG(LogNetPartialBunch, Log, TEXT("	OutgoingBunches.Num (%d) exceeds reliable threashold (%d). Making bunches reliable. Property replication will be paused on this channel until these are ACK'd."), OutgoingBunches.Num(), CVarNetPartialBunchReliableThreshold->GetInt());
+        #         Bunch->bReliable = true;
+        #         bPausedUntilReliableACK = true;
+        #     }
+        #     else
+        #     {
+        #         // The threshold was hit, but making these reliable would overflow the reliable buffer. This is a problem: there is just too much data.
+        #         UE_LOG(LogNetPartialBunch, Warning, TEXT("	OutgoingBunches.Num (%d) exceeds reliable threashold (%d) but this would overflow the reliable buffer! Consider sending less stuff. Channel: %s"), OutgoingBunches.Num(), CVarNetPartialBunchReliableThreshold->GetInt(), *Describe());
+        #     }
+        # }
+
+        # if (Bunch->bReliable && bOverflowsReliable)
+        # {
+        #     UE_LOG(LogNetPartialBunch, Warning, TEXT("SendBunch: Reliable partial bunch overflows reliable buffer! %s"), *Describe() );
+        #     UE_LOG(LogNetPartialBunch, Warning, TEXT("   Num OutgoingBunches: %d. NumOutRec: %d"), OutgoingBunches.Num(), NumOutRec );
+        #     PrintReliableBunchBuffer();
+
+        #     // Bail out, we can't recover from this (without increasing RELIABLE_BUFFER)
+        #     FString ErrorMsg = NSLOCTEXT("NetworkErrors", "ClientReliableBufferOverflow", "Outgoing reliable buffer overflow").ToString();
+        #     FNetControlMessage<NMT_Failure>::Send(Connection, ErrorMsg);
+        #     Connection->FlushNet(true);
+        #     Connection->Close();
+        
+        #     return PacketIdRange;
+        # }
+        # UE_CLOG((OutgoingBunches.Num() > 1), LogNetPartialBunch, Log, TEXT("Sending %d Bunches. Channel: %d %s"), OutgoingBunches.Num(), Bunch->ChIndex, *Describe());
+
+        PartialNum = 0
+        while PartialNum < len(self.OutgoingBunches):
+            NextBunch = self.OutgoingBunches[PartialNum]
+            
+            NextBunch.bReliable = Bunch.bReliable
+            NextBunch.bOpen = Bunch.bOpen
+            NextBunch.bClose = Bunch.bClose
+            NextBunch.bDormant = Bunch.bDormant
+            NextBunch.bIsReplicationPaused = Bunch.bIsReplicationPaused
+            NextBunch.ChIndex = Bunch.ChIndex
+            NextBunch.ChType = Bunch.ChType
+
+            if (not NextBunch.bHasPackageMapExports):
+                NextBunch.bHasMustBeMappedGUIDs |= Bunch.bHasMustBeMappedGUIDs
+            
+            if (len(OutgoingBunches) > 1):
+                NextBunch.bPartial = 1
+                NextBunch.bPartialInitial = (PartialNum == 0)
+                NextBunch.bPartialFinal = (PartialNum == len(self.OutgoingBunches) - 1)
+                NextBunch.bOpen &= (PartialNum == 0) # Only the first bunch should have the bOpen bit set
+                NextBunch.bClose = (Bunch.bClose and (len(self.OutgoingBunches) - 1 == PartialNum)) # Only last bunch should have bClose bit set
+
+            ThisOutBunch = self.PrepBunch(NextBunch, OutBunch, Merge) # This handles queuing reliable bunches into the ack list
+
+            # if (UE_LOG_ACTIVE(LogNetPartialBunch,Verbose) && (OutgoingBunches.Num() > 1)) // Don't want to call appMemcrc unless we need to
+            # {
+            #     UE_LOG(LogNetPartialBunch, Verbose, TEXT("	Bunch[%d]: Bytes: %d Bits: %d ChSequence: %d 0x%X"), PartialNum, ThisOutBunch->GetNumBytes(), ThisOutBunch->GetNumBits(), ThisOutBunch->ChSequence, FCrc::MemCrc_DEPRECATED(ThisOutBunch->GetData(), ThisOutBunch->GetNumBytes()));
+            # }
+
+            # Update Packet Range
+            PacketId = await self.SendRawBunch(ThisOutBunch, Merge)
+            if (PartialNum == 0):
+                PacketIdRange = FPacketIdRange(PacketId)
+            else:
+                PacketIdRange.Last = PacketId
+
+            # Update channel sequence count.
+            # Connection->LastOut = *ThisOutBunch;
+		    # Connection->LastEnd	= FBitWriterMark( Connection->SendBuffer );
+
+            PartialNum += 1
+
+    # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L1031
+    async def SendRawBunch(self, OutBunch: FOutBunch, Merge: bool) -> int:
+        if (self.Connection.bResendAllDataSinceOpen):
+            if self.OpenPacketId.First == -1:
+                return
+            if self.OpenPacketId.Last == -1:
+                return
+            return self.Connection.SendRawBunch(OutBunch, Merge)
+
+        # Send the raw bunch.
+        OutBunch.ReceivedAck = 0
+        PacketId = await self.Connection.SendRawBunch(OutBunch, Merge)
+
+        if (self.OpenPacketId.First == -1 and self.bOpenedLocally):
+            return
+        if (OutBunch.bClose):
+            self.SetClosingFlag()
+
+        return PacketId
+
+    # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L967
+    # This returns a pointer to Bunch, but it may either be a direct pointer, or a pointer to a copied instance of it
+    # OUtbunch is a bunch that was new'd by the network system or NULL. It should never be one created on the stack
+    def PrepBunch(self, Bunch: FOutBunch, OutBunch: FOutBunch, Merge: bool) -> FOutBunch:
+        if (self.Connection.bResendAllDataSinceOpen):
+            return Bunch
+
+        # TODO: Fix
+        
+        # Find outgoing bunch index.
+        if (Bunch.bReliable):
+            # Find spot, which was guaranteed available by FOutBunch constructor.
+            if (OutBunch == None):
+                # if not (NumOutRec < RELIABLE_BUFFER - 1 + Bunch.bClose):
+                #    return
+
+                # Bunch.ChSequence = self.Connection.OutReliable[ChIndex]
+                OutBunch = FOutBunch(Bunch)
+
+        return OutBunch
+
+    def AppendExportBunches(self):
+        return []
+
+    # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L670
+    def AppendMustBeMappedGuids(self, Bunch: FOutBunch):
+        PackageMapClient = self.Connection.PackageMap
+        MustBeMappedGuidsInLastBunch = PackageMapClient.GetMustBeMappedGuidsInLastBunch()
+
 
 # https://github.com/EpicGames/UnrealEngine/blob/2bf1a5b83a7076a0fd275887b373f8ec9e99d431/Engine/Source/Runtime/Engine/Classes/Engine/ControlChannel.h#L20
 class FQueuedControlMessage:
@@ -438,3 +651,16 @@ class UControlChannel(UChannel):
     # https://github.com/EpicGames/UnrealEngine/blob/2bf1a5b83a7076a0fd275887b373f8ec9e99d431/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L1856
     async def ReceiveDestructionInfo(self, Bunch: FInBunch):
         raise '"ReceiveDestructionInfo" not added yet'
+
+class UActorChannel(UChannel): # Not very useful I think
+    def __init__(self, *args, **kwargs):
+        self.Actor = None # NOTE: I think this is wrong
+        super().__init__(*args, **kwargs)
+
+    async def ProcessBunch(self, Bunch: FInBunch):
+        RepFlags = None # FReplicationFlags
+
+        # Initialize client if first time through.
+        bSpawnedNewActor = False # If this turns to true, we know an actor was spawned (rather than found)
+        if (self.Actor == None):
+            pass

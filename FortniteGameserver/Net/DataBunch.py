@@ -1,4 +1,5 @@
 from enum import Enum
+from ..UObject import FNetBitWriter
 from ..Serialization import FBitReader
     
 # A bunch of data received from a channel.
@@ -63,7 +64,7 @@ class FOutBunch:
             InChannel = kwargs['InChannel']
             bInClose = kwargs['bInClose']
 
-            self.FNetBitWriter = None # TODO: FNetBitWriter	( InChannel.Connection.PackageMap, InChannel.Connection.GetMaxSingleBunchSizeBits())
+            self.FNetBitWriter = FNetBitWriter(InChannel.Connection.PackageMap, InChannel.Connection.GetMaxSingleBunchSizeBits())
 
             self.ChIndex = InChannel.ChIndex
             self.ChType = InChannel.ChType
@@ -73,7 +74,10 @@ class FOutBunch:
             # TODO: SetByteSwapping(Channel->Connection->bNeedsByteSwapping);
 
         elif kwargs.get('InPackageMap') and kwargs.get('MaxBits'):
-            self.FNetBitWriter = None # TODO: FNetBitWriter	( InPackageMap, MaxBits )
+            self.FNetBitWriter = FNetBitWriter(kwargs.get('InPackageMap'), kwargs.get('MaxBits'))
+    
+    def GetNumBits(self):
+        return 0
 
 # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataBunch.cpp#L138
 class FControlChannelOutBunch(FOutBunch):

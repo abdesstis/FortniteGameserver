@@ -1,10 +1,10 @@
-from .Serialization import FBitReader
+from .Serialization import FBitReader, FBitWriter
 from .PacketHandlers import *
 
 from .Classes import EChannelType
 from .UObject import EChannelCloseReason
 from .Misc import EEngineNetworkVersionHistory
-from .Net import FInBunch
+from .Net import FInBunch, FOutBunch
 
 from .World import UWorld
 from .Net import UChannel, UControlChannel
@@ -17,6 +17,9 @@ MAX_CHSEQUENCE = 1024 # Power of 2 >RELIABLE_BUFFER, covering loss/misorder time
 
 # UE4.16 (https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Classes/Engine/NetConnection.h#L220)
 MAX_CHANNELS = 10240 # Maximum channels. TODO: This needs to differ per game somehow but cannot with shared executable
+
+# UE4.16
+MAX_BUNCH_HEADER_BITS = 64
 
 class UNetConnection():
     def __init__(self, socket, remote_addr: tuple, InMaxPacket: int = 1, InPacketOverhead: int = 1):
@@ -39,6 +42,12 @@ class UNetConnection():
         self.InTotalPackets = 0
         self.OutTotalPackets = 0
 
+        self.OutBunches = 0
+
+        self.InPacketId = 0
+
+        self.QueuedBits = 0
+
         self.InBytesPerSecond = 0
         self.OutBytesPerSecond = 0
         self.InPacketsPerSecond	= 0
@@ -46,6 +55,7 @@ class UNetConnection():
 
         self.InitHandler()
         self.InitTick()
+        self.InitBase()
         self.InitUnknown()
 
         # .-.
@@ -73,6 +83,7 @@ class UNetConnection():
         self.InReliable = [0] * MAX_CHSEQUENCE # NOTE: This is wrong and makes no sense...
         self.Channels = [None] * MAX_CHANNELS
         self.OpenChannels = []
+        self.bResendAllDataSinceOpen = False
 
     def IsInternalAck(self) -> bool:
         return False
@@ -81,6 +92,12 @@ class UNetConnection():
         # TODO: Parse almost all using https://github.com/EZFNDEV/FortLogReader
         return 2 # Season 1.8
         return 16 # Season 14.60
+
+    # The maximum number of bits allowed within a single bunch.
+    def GetMaxSingleBunchSizeBits(self) -> int:
+        # TODO: Fix self.MaxPacket
+        return 8000000
+        # return (MaxPacket * 8) - MAX_BUNCH_HEADER_BITS - MAX_PACKET_TRAILER_BITS - MAX_PACKET_HEADER_BITS - MaxPacketHandlerBits
 
     # NOTE: We are in the wrong class, this function should be in UChannel
     # https://github.com/EpicGames/UnrealEngine/blob/37ca478f5aa37e9dd49b68a7a39d01a9d5937154/Engine/Source/Runtime/Engine/Private/DataChannel.cpp#L1068
@@ -259,7 +276,7 @@ class UNetConnection():
 
             # Bunch claims it's larger than the enclosing packet.
             if (BunchDataBits > ((len(Reader.bytes) * 8) - Reader.bitpos)):
-                print(f'Bunch data overflowed ({Bunch.IncomingStartPos} {HeaderPos}+{BunchDataBits}/{len(Reader.bytes) * 8})')
+                # print(f'Bunch data overflowed ({Bunch.IncomingStartPos} {HeaderPos}+{BunchDataBits}/{len(Reader.bytes) * 8})')
                 return
 
             Bunch.SetData(Reader, BunchDataBits)
@@ -394,3 +411,55 @@ class UNetConnection():
 
     def CreateChannelByName(self, CreateFlags, ChIndex: int) -> UChannel: # TODO: EChannelCreateFlags CreateFlags
         raise Exception('Not supported yet.')
+    
+    async def SendPackageMap(self):
+        pass
+
+    # https://github.com/EpicGames/UnrealEngine/blob/2bf1a5b83a7076a0fd275887b373f8ec9e99d431/Engine/Source/Runtime/Engine/Private/NetConnection.cpp#L3054
+    async def SendRawBunch(self, Bunch: FOutBunch, InAllowMerge: bool, BunchCollector = None) -> int:
+        if Bunch.ReceivedAck:
+            return
+        self.OutBunches += 1
+        TimeSensitive = 1
+
+        # Build header.
+        Header = FBitWriter(MAX_BUNCH_HEADER_BITS)
+        Header.WriteBit(0)
+        Header.WriteBit(Bunch.bOpen or Bunch.bClose)
+        if (Bunch.bOpen or Bunch.bClose):
+            pass # TODO: Add this (Didnt need it yet)
+        Header.WriteBit(Bunch.bIsReplicationPaused)
+        Header.WriteBit(Bunch.bReliable)
+        Header.WriteIntWrapped(Bunch.ChIndex, MAX_CHANNELS)
+        Header.WriteBit(Bunch.bHasPackageMapExports)
+        Header.WriteBit(Bunch.bHasMustBeMappedGUIDs)
+        Header.WriteBit(Bunch.bPartial)
+        
+        if (Bunch.bReliable and not self.IsInternalAck()):
+            Header.WriteIntWrapped(Bunch.ChSequence, MAX_CHSEQUENCE)
+
+        if (Bunch.bPartial):
+            Header.WriteBit(Bunch.bPartialInitial)
+            Header.WriteBit(Bunch.bPartialFinal)
+
+        if (Bunch.bReliable or Bunch.bOpen):
+            Header.WriteIntWrapped(Bunch.ChType, EChannelType.CHTYPE_MAX.value)
+        
+        Header.WriteIntWrapped(Bunch.GetNumBits(), self.MaxPacket * 8)
+
+        print(Header.GetData())
+
+        await self.socket.send(Header.GetData(), self.remote_addr)
+        # Remember start position.
+        AllowMerge = InAllowMerge
+        # TODO: Bunch.Time      = Driver->Time;
+
+        # if ((Bunch.bClose || Bunch.bOpen) && UE_LOG_ACTIVE(LogNetDormancy,VeryVerbose) )
+        # {
+        #     UE_LOG(LogNetDormancy, VeryVerbose, TEXT("Sending: %s"), *Bunch.ToString());
+        # }
+
+        # if (UE_LOG_ACTIVE(LogNetTraffic,VeryVerbose))
+        # {
+        #     UE_LOG(LogNetTraffic, VeryVerbose, TEXT("Sending: %s"), *Bunch.ToString());
+        # }

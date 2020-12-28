@@ -161,5 +161,5 @@ class FBitReader(bitstring.ConstBitStream):
         else:
             _bytes = self.ReadBytes(Length)
 
-    def ReadVector(self):
-        pass
+    
+    

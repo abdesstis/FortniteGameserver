@@ -25,3 +25,17 @@ class FBitWriter():
 
     def GetData(self):
         return bitarray(''.join([str(bit) for bit in self.bits]), endian='little').tobytes()
+
+    def WriteIntWrapped(self, Value: int, ValueMax: int):
+        if not ValueMax >= 2:
+            return
+        
+        # LengthBits = FMath::CeilLogTwo(ValueMax);
+
+        NewValue = 0
+        Mask = 1
+        while (NewValue + Mask < Value and Mask):
+            if (Value & Mask):
+                self.WriteBit(1)
+                NewValue += Mask
+            Mask *= 2

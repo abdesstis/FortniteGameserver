@@ -4,6 +4,8 @@ class UPackageMapClient:
     def __init__(self, Connection):
         self.Connection = Connection
 
+        self.MustBeMappedGuidsInLastBunch = False
+
     # https://github.com/EpicGames/UnrealEngine/blob/2bf1a5b83a7076a0fd275887b373f8ec9e99d431/Engine/Source/Runtime/Engine/Private/PackageMapClient.cpp#L1319
     async def ReceiveNetGUIDBunch(self, InBunch: FInBunch):
         if not (InBunch.bHasPackageMapExports):
@@ -26,3 +28,6 @@ class UPackageMapClient:
         
         # Read number of net field exports
         NumLayoutCmdExports = 0
+
+    def GetMustBeMappedGuidsInLastBunch(self):
+        return self.MustBeMappedGuidsInLastBunch
